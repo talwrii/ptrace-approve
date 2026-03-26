@@ -1,6 +1,8 @@
 # ptrace-approve
 Trace system calls and manually approve them or create rules to match them.
 
+This is ai-generated unreviewed code. I have used it a coouple of times.
+
 ## Caveats
 AI-generated code, unreviewed, *slow*
 
@@ -11,8 +13,7 @@ I wanted to rub some vibe coded apps over my code and not have it destroy my cod
 This is influenced form a UI perspective by cluade code, where you approve individual commands.
 It uses ptrace and apparmor does similar things. Apparmore is faster, and can record rules to allow - but not does not have this sort of real time approval.
 
-
-## Installatinp
+## Installation
 pipx install ptrace-approve
 
 ## Usage
