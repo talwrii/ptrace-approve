@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ptrace-approve"
-version = "1.0.0"
+version = "1.0.1"
 description = "Intercept and approve filesystem-modifying syscalls"
 readme = "README.md"
 requires-python = ">=3.9"
