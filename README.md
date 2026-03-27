@@ -13,7 +13,9 @@ I wanted to rub some vibe coded apps over my code and not have it destroy my cod
 This is influenced form a UI perspective by cluade code, where you approve individual commands.
 It uses ptrace and apparmor does similar things. Apparmore is faster, and can record rules to allow - but not does not have this sort of real time approval.
 
-This use the `python-pytrace` library which does all the fiddly work
+This use the `python-pytrace` library which does all the fiddly work.
+
+Tools like austral can place limits at the module or functions using typeu systems.
 
 ## Installation
 pipx install ptrace-approve
