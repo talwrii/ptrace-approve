@@ -11,12 +11,15 @@ Patterns look like:
     exec(/bin/*, ...)              glob first arg, ignore rest
     open(*, write)                 any path, literal "write"
     open(/home/me/*, *)            glob path, any mode
+    open(**/__pycache__/*, *)      ** crosses directories
     exec(//usr/bin/py.+/, ...)     /regex/ on leaf
     exec(*, [/bin/*, ...])         match inside lists too
     delete(*)                      any single-arg delete
 
 Special tokens:
-    *      matches any single argument (string or list)
+    *      matches any single argument (string or list) when alone;
+           in a glob, matches characters except /
+    **     in a glob, matches characters including /
     ...    matches zero or more remaining arguments
     /X/    leaf is matched as regex X (first and last char are /)
     other strings with * or ? are globs
@@ -24,7 +27,6 @@ Special tokens:
 """
 
 import re
-from fnmatch import fnmatchcase
 
 
 # ---------------------------------------------------------------------------
@@ -111,13 +113,61 @@ def parse(s):
 # Matcher
 # ---------------------------------------------------------------------------
 
+def _glob_to_regex(pattern):
+    """Convert a glob pattern to a regex.
+
+    * matches any characters except /
+    ** matches zero or more path components (including /)
+    ? matches a single character except /
+    """
+    result = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == '*' and i + 1 < n and pattern[i + 1] == '*':
+            # ** — handle surrounding slashes so it can match zero components
+            has_slash_before = (i > 0 and pattern[i - 1] == '/' and result and result[-1] == '/')
+            has_slash_after = (i + 2 < n and pattern[i + 2] == '/')
+            if has_slash_before and has_slash_after:
+                # /**/  →  match "/" or "/anything/"
+                result.pop()  # remove the / we already emitted
+                result.append('(/.+)?/')
+                i += 3  # skip ** and the trailing /
+            elif has_slash_before:
+                # /** at end  →  optionally /anything
+                result.pop()
+                result.append('(/.*)?')
+                i += 2
+            elif has_slash_after:
+                # **/ at start  →  optionally anything/
+                result.append('(.*/)?')
+                i += 3
+            else:
+                result.append('.*')
+                i += 2
+        elif ch == '*':
+            result.append('[^/]*')
+            i += 1
+        elif ch == '?':
+            result.append('[^/]')
+            i += 1
+        elif ch in r'\.+^${}()|[]':
+            result.append('\\' + ch)
+            i += 1
+        else:
+            result.append(ch)
+            i += 1
+    return ''.join(result)
+
+
 def _match_leaf(pattern, value):
     """Match a pattern string against a value string.
 
-    - "*" matches anything
+    - "*" matches anything (as a whole argument)
     - "..." is handled by caller
     - "/X/" matches value against regex X
-    - patterns containing * or ? are globs
+    - patterns containing * or ? are globs (* = not /, ** = anything)
     - everything else is literal
     """
     if pattern == '*':
@@ -126,7 +176,7 @@ def _match_leaf(pattern, value):
         regex = pattern[1:-1]
         return bool(re.fullmatch(regex, value))
     if '*' in pattern or '?' in pattern:
-        return fnmatchcase(value, pattern)
+        return bool(re.fullmatch(_glob_to_regex(pattern), value))
     return pattern == value
 
 

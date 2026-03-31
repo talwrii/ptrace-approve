@@ -85,10 +85,26 @@ class TestMatchLeaf:
         assert _match_leaf("/bin/*", "/usr/bin/true") is False
         assert _match_leaf("/home/*/projects/*", "/home/me/projects/foo") is True
 
+    def test_glob_star_does_not_match_slash(self):
+        # * should not cross directory boundaries
+        assert _match_leaf("/home/*/foo", "/home/me/foo") is True
+        assert _match_leaf("/home/*/foo", "/home/me/sub/foo") is False
+        assert _match_leaf("*/__pycache__/*", "/home/bruger/__pycache__/foo.pyc") is False
+
+    def test_glob_doublestar(self):
+        # ** matches across directories
+        assert _match_leaf("**/__pycache__/*", "/home/bruger/mine/project/__pycache__/foo.pyc") is True
+        assert _match_leaf("**/__pycache__/**", "/a/b/__pycache__/c/d.pyc") is True
+        assert _match_leaf("/home/**/__pycache__/*", "/home/bruger/mine/project/__pycache__/foo.pyc") is True
+        assert _match_leaf("/home/**/__pycache__/*", "/home/__pycache__/foo.pyc") is True
+
     def test_glob_question(self):
         assert _match_leaf("/bin/tru?", "/bin/true") is True
         assert _match_leaf("/bin/tru?", "/bin/trux") is True
         assert _match_leaf("/bin/tru?", "/bin/tr") is False
+
+    def test_glob_question_does_not_match_slash(self):
+        assert _match_leaf("/bin/tru?", "/bin/tru/") is False
 
     def test_regex(self):
         assert _match_leaf("//bin/tr.+/", "/bin/true") is True
@@ -178,7 +194,16 @@ class TestMatch:
 
     # --- real-world descriptions ---
     def test_open_create_write(self):
-        assert match("open(/home/*, ...)", "open(/home/me/foo.txt, create+write)") is True
+        assert match("open(/home/**, ...)", "open(/home/me/foo.txt, create+write)") is True
+
+    def test_open_star_does_not_cross_dirs(self):
+        assert match("open(/home/*, ...)", "open(/home/me/foo.txt, create+write)") is False
+        assert match("open(/home/*, ...)", "open(/home/foo.txt, create+write)") is True
+
+    def test_pycache(self):
+        desc = "open(/home/bruger/mine/machine-sync/machine_sync/__pycache__/main.cpython-312.pyc.123, create+write)"
+        assert match("open(**/__pycache__/*, *)", desc) is True
+        assert match("open(*/__pycache__/*, *)", desc) is False
 
     def test_mkdir(self):
         assert match("mkdir(/tmp/*)", "mkdir(/tmp/newdir)") is True

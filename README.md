@@ -32,6 +32,16 @@ the abolsute path to app app is found and a default profile is stored for the ap
 
 ptrace-approve --clear app
 
+Patterns 
+
+/regexp/
+**/__pycache__/*
+`*` does not match forwards slashes
+"*" - literal
+...
+_ - any argument
+
+
 
 ## Change log
 
