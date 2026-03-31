@@ -9,20 +9,19 @@ Descriptions look like:
 Patterns look like:
     exec(...)                      match any exec
     exec(/bin/*, ...)              glob first arg, ignore rest
-    open(*, write)                 any path, literal "write"
-    open(/home/me/*, *)            glob path, any mode
-    open(**/__pycache__/*, *)      ** crosses directories
+    open(_, write)                 any path, literal "write"
+    open(/home/me/*, _)            glob path, any mode
+    open(**/__pycache__/*, _)      ** crosses directories
     exec(//usr/bin/py.+/, ...)     /regex/ on leaf
-    exec(*, [/bin/*, ...])         match inside lists too
-    delete(*)                      any single-arg delete
+    exec(_, [/bin/*, ...])         match inside lists too
+    delete(_)                      any single-arg delete
 
 Special tokens:
-    *      matches any single argument (string or list) when alone;
-           in a glob, matches characters except /
-    **     in a glob, matches characters including /
+    _      matches any single argument (string or list)
     ...    matches zero or more remaining arguments
+    *      in a glob, matches characters except /
+    **     in a glob, matches characters including /
     /X/    leaf is matched as regex X (first and last char are /)
-    other strings with * or ? are globs
     other strings are literal matches
 """
 
@@ -149,10 +148,7 @@ def _glob_to_regex(pattern):
         elif ch == '*':
             result.append('[^/]*')
             i += 1
-        elif ch == '?':
-            result.append('[^/]')
-            i += 1
-        elif ch in r'\.+^${}()|[]':
+        elif ch in r'\.+^${}()|[]?':
             result.append('\\' + ch)
             i += 1
         else:
@@ -164,18 +160,18 @@ def _glob_to_regex(pattern):
 def _match_leaf(pattern, value):
     """Match a pattern string against a value string.
 
-    - "*" matches anything (as a whole argument)
+    - "_" matches anything (as a whole argument)
     - "..." is handled by caller
     - "/X/" matches value against regex X
-    - patterns containing * or ? are globs (* = not /, ** = anything)
+    - patterns containing * are globs (* = not /, ** = anything)
     - everything else is literal
     """
-    if pattern == '*':
+    if pattern == '_':
         return True
     if len(pattern) >= 2 and pattern[0] == '/' and pattern[-1] == '/':
         regex = pattern[1:-1]
         return bool(re.fullmatch(regex, value))
-    if '*' in pattern or '?' in pattern:
+    if '*' in pattern:
         return bool(re.fullmatch(_glob_to_regex(pattern), value))
     return pattern == value
 
@@ -217,15 +213,15 @@ def _match_value(pattern, value):
     if isinstance(pattern, list) and isinstance(value, list):
         return _match_args(pattern, value)
 
-    # pattern is *, matches anything including lists
-    if pattern == '*':
+    # _ matches anything including lists
+    if pattern == '_':
         return True
 
     # pattern is a string, value is a string
     if isinstance(pattern, str) and isinstance(value, str):
         return _match_leaf(pattern, value)
 
-    # pattern is a string (not *), value is a list — no match
+    # pattern is a string (not _), value is a list — no match
     # pattern is a list, value is a string — no match
     return False
 

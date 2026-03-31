@@ -76,9 +76,9 @@ class TestMatchLeaf:
         assert _match_leaf("write", "write") is True
         assert _match_leaf("write", "read") is False
 
-    def test_star(self):
-        assert _match_leaf("*", "anything") is True
-        assert _match_leaf("*", "") is True
+    def test_underscore(self):
+        assert _match_leaf("_", "anything") is True
+        assert _match_leaf("_", "") is True
 
     def test_glob(self):
         assert _match_leaf("/bin/*", "/bin/true") is True
@@ -97,14 +97,6 @@ class TestMatchLeaf:
         assert _match_leaf("**/__pycache__/**", "/a/b/__pycache__/c/d.pyc") is True
         assert _match_leaf("/home/**/__pycache__/*", "/home/bruger/mine/project/__pycache__/foo.pyc") is True
         assert _match_leaf("/home/**/__pycache__/*", "/home/__pycache__/foo.pyc") is True
-
-    def test_glob_question(self):
-        assert _match_leaf("/bin/tru?", "/bin/true") is True
-        assert _match_leaf("/bin/tru?", "/bin/trux") is True
-        assert _match_leaf("/bin/tru?", "/bin/tr") is False
-
-    def test_glob_question_does_not_match_slash(self):
-        assert _match_leaf("/bin/tru?", "/bin/tru/") is False
 
     def test_regex(self):
         assert _match_leaf("//bin/tr.+/", "/bin/true") is True
@@ -145,30 +137,30 @@ class TestMatch:
 
     # --- literal ---
     def test_literal_match(self):
-        assert match("open(*, write)", "open(/tmp/foo, write)") is True
+        assert match("open(_, write)", "open(/tmp/foo, write)") is True
 
     def test_literal_no_match(self):
-        assert match("open(*, write)", "open(/tmp/foo, read)") is False
+        assert match("open(_, write)", "open(/tmp/foo, read)") is False
 
-    # --- star matches anything ---
-    def test_star_matches_string(self):
-        assert match("delete(*)", "delete(/tmp/junk)") is True
+    # --- _ matches anything ---
+    def test_underscore_matches_string(self):
+        assert match("delete(_)", "delete(/tmp/junk)") is True
 
-    def test_star_matches_list(self):
-        assert match("exec(*, *)", "exec(/bin/true, [/bin/true, 1])") is True
+    def test_underscore_matches_list(self):
+        assert match("exec(_, _)", "exec(/bin/true, [/bin/true, 1])") is True
 
     # --- list patterns ---
     def test_list_pattern(self):
-        assert match("exec(*, [/bin/*, ...])", "exec(/bin/true, [/bin/true, 1])") is True
+        assert match("exec(_, [/bin/*, ...])", "exec(/bin/true, [/bin/true, 1])") is True
 
     def test_list_pattern_no_match(self):
-        assert match("exec(*, [/usr/*, ...])", "exec(/bin/true, [/bin/true, 1])") is False
+        assert match("exec(_, [/usr/*, ...])", "exec(/bin/true, [/bin/true, 1])") is False
 
     def test_list_exact(self):
-        assert match("exec(*, [/bin/true, 1])", "exec(/bin/true, [/bin/true, 1])") is True
+        assert match("exec(_, [/bin/true, 1])", "exec(/bin/true, [/bin/true, 1])") is True
 
     def test_list_wrong_length(self):
-        assert match("exec(*, [/bin/true])", "exec(/bin/true, [/bin/true, 1])") is False
+        assert match("exec(_, [/bin/true])", "exec(/bin/true, [/bin/true, 1])") is False
 
     # --- regex ---
     def test_regex_match(self):
@@ -187,10 +179,10 @@ class TestMatch:
         assert match("exec(/bin/true)", "exec(/bin/true, [/bin/true, 1])") is False
 
     def test_too_many_pattern_args(self):
-        assert match("exec(*, *, *)", "exec(/bin/true, [/bin/true])") is False
+        assert match("exec(_, _, _)", "exec(/bin/true, [/bin/true])") is False
 
     def test_exact_arity(self):
-        assert match("open(/home/me/*, *)", "open(/home/me/foo.txt, create+write)") is True
+        assert match("open(/home/me/*, _)", "open(/home/me/foo.txt, create+write)") is True
 
     # --- real-world descriptions ---
     def test_open_create_write(self):
@@ -202,17 +194,17 @@ class TestMatch:
 
     def test_pycache(self):
         desc = "open(/home/bruger/mine/machine-sync/machine_sync/__pycache__/main.cpython-312.pyc.123, create+write)"
-        assert match("open(**/__pycache__/*, *)", desc) is True
-        assert match("open(*/__pycache__/*, *)", desc) is False
+        assert match("open(**/__pycache__/*, _)", desc) is True
+        assert match("open(*/__pycache__/*, _)", desc) is False
 
     def test_mkdir(self):
         assert match("mkdir(/tmp/*)", "mkdir(/tmp/newdir)") is True
 
     def test_chmod(self):
-        assert match("chmod(*, *)", "chmod(/tmp/foo, 0o755)") is True
+        assert match("chmod(_, _)", "chmod(/tmp/foo, 0o755)") is True
 
     def test_rename(self):
-        assert match("rename(*, ...)", "rename(/old -> /new)") is True
+        assert match("rename(_, ...)", "rename(/old -> /new)") is True
 
 
 # ---------------------------------------------------------------------------
@@ -221,11 +213,11 @@ class TestMatch:
 
 class TestMatchesAny:
     def test_one_matches(self):
-        patterns = ["open(*, write)", "exec(...)"]
+        patterns = ["open(_, write)", "exec(...)"]
         assert matches_any(patterns, "exec(/bin/ls, [/bin/ls])") is True
 
     def test_none_match(self):
-        patterns = ["open(*, write)", "delete(*)"]
+        patterns = ["open(_, write)", "delete(_)"]
         assert matches_any(patterns, "exec(/bin/ls, [/bin/ls])") is False
 
     def test_empty_patterns(self):
