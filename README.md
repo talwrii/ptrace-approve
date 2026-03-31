@@ -31,3 +31,8 @@ Individually approve rules or add patterns. `.` in patterns does not match ,'s o
 the abolsute path to app app is found and a default profile is stored for the app based on this path.
 
 ptrace-approve --clear app
+
+
+## Change log
+
+2.0.0 - Change match format
