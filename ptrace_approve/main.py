@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import struct
 import sys
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,8 @@ from ptrace.func_call import FunctionCallOptions
 from ptrace.syscall import PtraceSyscall, SYSCALL_NAMES
 from ptrace.tools import signal_to_exitcode
 
+from ptrace_approve.match import matches_any
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -24,22 +27,22 @@ PROFILE_FILE = CONFIG_DIR / "profiles.json"
 
 # Syscalls we care about and how to describe them
 WATCHED_SYSCALLS = {
-    # name -> lambda args: description string
-    "openat":    lambda a: _openat_desc(a),
-    "open":      lambda a: _open_desc(a),
-    "creat":     lambda a: f"create({_str(a,0)})",
-    "unlink":    lambda a: f"delete({_str(a,0)})",
-    "unlinkat":  lambda a: f"delete({_str(a,1)})",
-    "rename":    lambda a: f"rename({_str(a,0)} -> {_str(a,1)})",
-    "renameat":  lambda a: f"rename({_str(a,1)} -> {_str(a,3)})",
-    "renameat2": lambda a: f"rename({_str(a,1)} -> {_str(a,3)})",
-    "mkdir":     lambda a: f"mkdir({_str(a,0)})",
-    "mkdirat":   lambda a: f"mkdir({_str(a,1)})",
-    "rmdir":     lambda a: f"rmdir({_str(a,0)})",
-    "chmod":     lambda a: f"chmod({_str(a,0)}, {_str(a,1)})",
-    "fchmodat":  lambda a: f"chmod({_str(a,1)}, {_str(a,2)})",
-    "execve":    lambda a: f"exec({_str(a,0)})",
-    "execveat":  lambda a: f"exec({_str(a,1)})",
+    # name -> lambda args, proc: description string
+    "openat":    lambda a, p: _openat_desc(a),
+    "open":      lambda a, p: _open_desc(a),
+    "creat":     lambda a, p: f"create({_str(a,0)})",
+    "unlink":    lambda a, p: f"delete({_str(a,0)})",
+    "unlinkat":  lambda a, p: f"delete({_str(a,1)})",
+    "rename":    lambda a, p: f"rename({_str(a,0)} -> {_str(a,1)})",
+    "renameat":  lambda a, p: f"rename({_str(a,1)} -> {_str(a,3)})",
+    "renameat2": lambda a, p: f"rename({_str(a,1)} -> {_str(a,3)})",
+    "mkdir":     lambda a, p: f"mkdir({_str(a,0)})",
+    "mkdirat":   lambda a, p: f"mkdir({_str(a,1)})",
+    "rmdir":     lambda a, p: f"rmdir({_str(a,0)})",
+    "chmod":     lambda a, p: f"chmod({_str(a,0)}, {_str(a,1)})",
+    "fchmodat":  lambda a, p: f"chmod({_str(a,1)}, {_str(a,2)})",
+    "execve":    lambda a, p: _execve_desc(a, p),
+    "execveat":  lambda a, p: _execveat_desc(a, p),
 }
 
 def _get_flags(args, i):
@@ -69,7 +72,6 @@ def _str(args, i):
         a = args[i]
         t = a.getText()
         if t:
-            # strip surrounding quotes if present
             t = t.strip("'\"")
             return t
         v = a.value
@@ -103,6 +105,46 @@ def _open_desc(args):
         return f"open({path}, {'+'.join(mode)})"
     return None
 
+def _read_argv(proc, addr):
+    """Read argv char** from process memory, return formatted [arg, arg, 'arg with spaces']."""
+    parts = []
+    offset = 0
+    while len(parts) < 20:
+        try:
+            raw = proc.readBytes(addr + offset, 8)
+            ptr = struct.unpack('<Q', bytes(raw))[0]
+            if ptr == 0:
+                break
+            s = proc.readCString(ptr, 300)
+            if isinstance(s, tuple):
+                s = s[0]
+            if isinstance(s, bytes):
+                s = s.decode(errors='replace')
+            if re.search(r'[\s,\[\]\'"]', s):
+                s = f"'{s}'"
+            parts.append(s)
+            offset += 8
+        except Exception as e:
+            print(f"DEBUG _read_argv offset={offset} addr={addr:#x}: {e}", file=sys.stderr)
+            break
+    return '[' + ', '.join(parts) + ']' if parts else ''
+
+def _execve_desc(args, proc):
+    path = _str(args, 0)
+    try:
+        argv = _read_argv(proc, args[1].value)
+    except Exception:
+        argv = ''
+    return f"exec({path}, {argv})" if argv else f"exec({path})"
+
+def _execveat_desc(args, proc):
+    path = _str(args, 1)
+    try:
+        argv = _read_argv(proc, args[2].value)
+    except Exception:
+        argv = ''
+    return f"exec({path}, {argv})" if argv else f"exec({path})"
+
 # ---------------------------------------------------------------------------
 # Profile
 # ---------------------------------------------------------------------------
@@ -125,47 +167,6 @@ def add_pattern(profiles: dict, app_key: str, pattern: str):
         profiles[app_key] = []
     if pattern not in profiles[app_key]:
         profiles[app_key].append(pattern)
-
-def preprocess_pattern(pattern: str) -> str:
-    """Replace unescaped . with [^,)] so dots don't match , or ) by default."""
-    result = []
-    i = 0
-    in_class = False
-    while i < len(pattern):
-        ch = pattern[i]
-        if ch == '\\':
-            # escaped char — pass through both chars unchanged
-            result.append(ch)
-            if i + 1 < len(pattern):
-                result.append(pattern[i + 1])
-                i += 2
-            else:
-                i += 1
-        elif ch == '[':
-            in_class = True
-            result.append(ch)
-            i += 1
-        elif ch == ']':
-            in_class = False
-            result.append(ch)
-            i += 1
-        elif ch == '.' and not in_class:
-            result.append('[^,)]')
-            i += 1
-        else:
-            result.append(ch)
-            i += 1
-    return ''.join(result)
-
-
-def matches_any(patterns: list, description: str) -> bool:
-    for p in patterns:
-        try:
-            if re.search(preprocess_pattern(p), description):
-                return True
-        except re.error:
-            pass
-    return False
 
 # ---------------------------------------------------------------------------
 # UI
@@ -191,12 +192,10 @@ def input_with_default(prompt: str, default: str) -> str:
             readline.set_pre_input_hook(None)
         return result
     except Exception:
-        # Fallback if readline unavailable
         sys.stdout.write(f"{prompt}[{default}]: ")
         sys.stdout.flush()
         line = sys.stdin.readline().strip()
         return line if line else default
-
 
 def prompt_user(description: str, app_key: str, profiles: dict) -> bool:
     """Ask the user what to do. Returns True to allow, False to deny."""
@@ -205,60 +204,43 @@ def prompt_user(description: str, app_key: str, profiles: dict) -> bool:
           f"{CYAN}[p]{RESET} add pattern   "
           f"{CYAN}[d]{RESET} deny once   "
           f"{CYAN}[D]{RESET} deny + pattern")
-
     while True:
         try:
             sys.stdout.write("  > ")
             sys.stdout.flush()
-            ch = sys.stdin.readline().strip().lower()
+            ch = sys.stdin.readline().strip()
         except (EOFError, KeyboardInterrupt):
             return False
-
         if ch == 'a':
             print(f"  {GREEN}✓ allowed{RESET}")
             return True
-
         elif ch == 'p':
-            suggested = re.escape(description)
-            pattern = input_with_default("  Pattern (regexp): ", suggested)
-            try:
-                re.compile(preprocess_pattern(pattern))
-                add_pattern(profiles, app_key, pattern)
-                save_profiles(profiles)
-                print(f"  {GREEN}✓ pattern saved, allowed{RESET}")
-                return True
-            except re.error as e:
-                print(f"  {RED}Invalid regexp: {e}{RESET}")
-                # loop back
-
+            pattern = input_with_default("  Pattern: ", description)
+            add_pattern(profiles, app_key, pattern)
+            save_profiles(profiles)
+            print(f"  {GREEN}✓ pattern saved, allowed{RESET}")
+            return True
         elif ch == 'd':
             print(f"  {RED}✗ denied{RESET}")
             return False
-
-        elif ch in ('d', 'D') or ch == 'D':
-            suggested = re.escape(description)
-            pattern = input_with_default("  Deny pattern (regexp): ", suggested)
-            try:
-                re.compile(preprocess_pattern(pattern))
-                # Store deny patterns with a prefix
-                add_pattern(profiles, app_key + ":deny", pattern)
-                save_profiles(profiles)
-                print(f"  {RED}✗ deny pattern saved{RESET}")
-                return False
-            except re.error as e:
-                print(f"  {RED}Invalid regexp: {e}{RESET}")
-
+        elif ch == 'D':
+            pattern = input_with_default("  Deny pattern: ", description)
+            add_pattern(profiles, app_key + ":deny", pattern)
+            save_profiles(profiles)
+            print(f"  {RED}✗ deny pattern saved{RESET}")
+            return False
         else:
             print(f"  Use a/p/d/D")
 
 # ---------------------------------------------------------------------------
 # Core ptrace loop
 # ---------------------------------------------------------------------------
-def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False):
+def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_only: bool = False):
     from ptrace.debugger.child import createChild
     debugger = PtraceDebugger()
     debugger.traceFork()
     debugger.traceExec()
+
     try:
         pid = createChild(cmd, no_stdout=False)
         process = debugger.addProcess(pid, is_attached=True)
@@ -283,7 +265,6 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False):
 
     exit_code = 0
     active = 1
-
     while active > 0:
         try:
             event = debugger.waitProcessEvent()
@@ -311,17 +292,14 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False):
         if isinstance(event, ProcessSignal):
             signum = event.signum
             if signum in (SIGTRAP, SIGSTOP, SYSCALL_STOP):
-                # syscall-stop or attach-stop — treat as syscall event below
                 proc = event.process
             else:
-                # real signal — forward it
                 try: event.process.syscall(signum)
                 except Exception: pass
                 continue
         else:
             proc = event.process
 
-        # Process syscall entry/exit
         try:
             syscall = proc.syscall_state.event(syscall_options)
         except Exception:
@@ -329,7 +307,6 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False):
             except Exception: pass
             continue
 
-        # skip exit side or empty
         if syscall is None or syscall.result is not None:
             try: proc.syscall()
             except Exception: pass
@@ -338,11 +315,17 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False):
         name = syscall.name
         if name in WATCHED_SYSCALLS:
             try:
-                desc = WATCHED_SYSCALLS[name](syscall.arguments)
+                desc = WATCHED_SYSCALLS[name](syscall.arguments, proc)
             except Exception:
                 desc = name
 
             if desc is None:
+                try: proc.syscall()
+                except Exception: pass
+                continue
+
+            if log_only:
+                print(desc)
                 try: proc.syscall()
                 except Exception: pass
                 continue
@@ -366,7 +349,6 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False):
                 continue
 
             allowed = prompt_user(desc, app_key, profiles)
-
             if allowed:
                 try: proc.syscall()
                 except Exception: pass
@@ -380,25 +362,21 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False):
     except Exception: pass
     return exit_code
 
-
 def _deny_syscall(proc):
     """Replace syscall number with -1 to make it a no-op, return EPERM."""
     try:
         regs = proc.getregs()
-        # On x86_64, syscall number is in orig_rax
         regs.orig_rax = 0xffffffffffffffff  # invalid syscall
         proc.setregs(regs)
     except Exception:
         pass
     proc.syscall()
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def clear_profile(app_key: str):
     import shutil
-    # Resolve to full path like main() does
     resolved = shutil.which(app_key) or app_key
     profiles = load_profiles()
     removed = False
@@ -412,7 +390,6 @@ def clear_profile(app_key: str):
     else:
         print(f"No profile found for {resolved}")
 
-
 def list_profiles():
     profiles = load_profiles()
     if not profiles:
@@ -425,7 +402,6 @@ def list_profiles():
         for p in patterns:
             print(f"  {p}")
 
-
 def main():
     parser = argparse.ArgumentParser(
         description="Intercept and approve filesystem-modifying syscalls."
@@ -433,13 +409,16 @@ def main():
     parser.add_argument("cmd", nargs="*", help="Command to run")
     parser.add_argument("--clear", metavar="APP",
                         help="Clear saved profile for APP")
+    parser.add_argument("--clear-run", action="store_true",
+                        help="Clear saved profile for the command before running it")
     parser.add_argument("--list", action="store_true",
                         help="List all saved profiles")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress startup messages")
     parser.add_argument("-P", "--no-prompt", action="store_true",
                         help="Only use saved profile — deny anything not matched, no interactive prompts")
-
+    parser.add_argument("--log-only", action="store_true",
+                        help="Log all watched syscalls as descriptions and allow everything — no prompts, no profile")
     args = parser.parse_args()
 
     if args.list:
@@ -454,24 +433,35 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    # Resolve app key from binary path
     import shutil
     binary = shutil.which(args.cmd[0]) or args.cmd[0]
     app_key = binary
-
     profiles = load_profiles()
 
+    if args.clear_run:
+        removed = False
+        for key in [binary, binary + ":deny"]:
+            if key in profiles:
+                del profiles[key]
+                removed = True
+        if removed:
+            save_profiles(profiles)
+            if not args.quiet:
+                print(f"Cleared profile for {binary}")
+
     if not args.quiet:
-        print(f"{CYAN}ptrace-approve{RESET}: watching {BOLD}{' '.join(args.cmd)}{RESET}")
-        print(f"Profile: {app_key}")
-        patterns = get_patterns(profiles, app_key)
-        if patterns:
-            print(f"Loaded {len(patterns)} allow pattern(s)")
+        if args.log_only:
+            print(f"{CYAN}ptrace-approve{RESET}: logging {BOLD}{' '.join(args.cmd)}{RESET} (all allowed)")
+        else:
+            print(f"{CYAN}ptrace-approve{RESET}: watching {BOLD}{' '.join(args.cmd)}{RESET}")
+            print(f"Profile: {app_key}")
+            patterns = get_patterns(profiles, app_key)
+            if patterns:
+                print(f"Loaded {len(patterns)} allow pattern(s)")
         print()
 
-    exit_code = run(args.cmd, app_key, profiles, no_prompt=args.no_prompt)
+    exit_code = run(args.cmd, app_key, profiles, no_prompt=args.no_prompt, log_only=args.log_only)
     sys.exit(exit_code)
-
 
 if __name__ == "__main__":
     main()

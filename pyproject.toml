@@ -8,7 +8,7 @@ version = "1.0.3"
 description = "Intercept and approve filesystem-modifying syscalls"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = [ "python-ptrace>=0.9.9",]
+dependencies = [ "python-ptrace>=0.9.9", "pytest"]
 
 [project.license]
 text = "MIT"
