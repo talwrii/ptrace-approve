@@ -10,14 +10,13 @@ AI-generated code, unreviewed, *slow*. This runs python code on every system cal
 
 Child processes and not traced (`strace -f`) (but you approve when the are spawned).
 
-
 ## Motivation
 I wanted to rub some vibe coded apps over my code and not have it destroy my code.
 
 ## Alternatives and prior work
 This is influenced form a UI perspective by cluade code, where you approve individual commands as claude wishes to run them, optionally adding exceptions. There is a tool called `maybe` which is a similar idea and has been declared as unmaintained by it's previous maintainer.
 
-`ptrace-approve` uses ptrace and apparmor does similar things. Apparmor is faster, and can record rules to allow - but not does not have this sort of interactive real time approval.  `ptrace-approve` use the `python-pytrace` library which does all the fiddly work.
+`ptrace-approve` uses ptrace and apparmor does similar things. Apparmor is faster, and can record rules to allow - but not does not have this sort of interactive real time approval.  `ptrace-approve` use the `python-pytrace` library which does all the fiddly work. This does the last mile of making something useful and doing pattern matching.
 
 Tools like austral can place limits at the module or function level using a type systems.
 
