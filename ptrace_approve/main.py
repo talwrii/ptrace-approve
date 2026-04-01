@@ -13,12 +13,12 @@ from pathlib import Path
 from typing import Optional
 
 from ptrace.debugger import PtraceDebugger, ProcessExit, ProcessSignal
-from ptrace.debugger.process_event import ProcessExecution
+from ptrace.debugger.process_event import ProcessExecution, NewProcessEvent
 from ptrace.func_call import FunctionCallOptions
 from ptrace.syscall import PtraceSyscall, SYSCALL_NAMES
 from ptrace.tools import signal_to_exitcode
 
-from ptrace_approve.match import matches_any
+from ptrace_approve.match import matches_any, find_match
 
 # Suppress python-ptrace's noisy logging for transient read failures
 logging.getLogger().setLevel(logging.CRITICAL)
@@ -212,20 +212,21 @@ def input_with_default(prompt: str, default: str) -> str:
         line = sys.stdin.readline().strip()
         return line if line else default
 
-def prompt_user(description: str, app_key: str, profiles: dict) -> bool:
-    """Ask the user what to do. Returns True to allow, False to deny."""
+def prompt_user(description: str, app_key: str, profiles: dict):
+    """Ask the user what to do. Returns True to allow, False to deny, None to quit."""
     print(f"\n{BOLD}{YELLOW}⚡ {description}{RESET}")
     print(f"  {CYAN}[a]{RESET} approve once   "
           f"{CYAN}[p]{RESET} add pattern   "
           f"{CYAN}[d]{RESET} deny once   "
-          f"{CYAN}[D]{RESET} deny + pattern")
+          f"{CYAN}[D]{RESET} deny + pattern   "
+          f"{CYAN}[q]{RESET} quit")
     while True:
         try:
             sys.stdout.write("  > ")
             sys.stdout.flush()
             ch = sys.stdin.readline().strip()
         except (EOFError, KeyboardInterrupt):
-            return False
+            return None
         if ch == 'a':
             print(f"  {GREEN}✓ allowed{RESET}")
             return True
@@ -244,27 +245,41 @@ def prompt_user(description: str, app_key: str, profiles: dict) -> bool:
             save_profiles(profiles)
             print(f"  {RED}✗ deny pattern saved{RESET}")
             return False
+        elif ch == 'q':
+            print(f"  {RED}quit{RESET}")
+            return None
         else:
-            print(f"  Use a/p/d/D")
+            print(f"  Use a/p/d/D/q")
 
 # ---------------------------------------------------------------------------
 # Core ptrace loop
 # ---------------------------------------------------------------------------
-def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_only: bool = False, strace_file=None):
+def _proc_cmdline(pid):
+    """Read command line for a pid from /proc."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return ' '.join(raw.decode(errors='replace').split('\0')).strip()
+    except Exception:
+        return "?"
+
+def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_only: bool = False, strace_file=None, debug: bool = False):
     from ptrace.debugger.child import createChild
     debugger = PtraceDebugger()
-    # Don't traceFork — child process memory can't be read reliably via python-ptrace
+    debugger.traceFork()
     debugger.traceExec()
 
     try:
         pid = createChild(cmd, no_stdout=False)
+        initial_pid = pid
         process = debugger.addProcess(pid, is_attached=True)
     except Exception as e:
         print(f"Error starting process: {e}", file=sys.stderr)
         sys.exit(1)
 
-    process.syscall()
+    if debug:
+        print(f"{CYAN}initial pid: {initial_pid}{RESET}")
 
+    process.syscall()
     syscall_options = FunctionCallOptions(
         write_types=False,
         write_argname=False,
@@ -276,8 +291,8 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
 
     from signal import SIGTRAP, SIGSTOP
     SYSCALL_STOP = SIGTRAP | 0x80  # sysgood bit set = syscall-stop
-
     exit_code = 0
+
     while True:
         try:
             event = debugger.waitProcessEvent()
@@ -285,12 +300,23 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
             break
 
         if isinstance(event, ProcessExit):
-            exit_code = event.exitcode or 0
-            break
+            if event.process.pid == initial_pid:
+                exit_code = event.exitcode or 0
+                break
+            else:
+                continue
 
         if isinstance(event, ProcessExecution):
             try: event.process.syscall()
             except Exception: pass
+            continue
+
+        if isinstance(event, NewProcessEvent):
+            try: event.process.syscall()
+            except Exception: pass
+            if event.process.parent is not None:
+                try: event.process.parent.syscall()
+                except Exception: pass
             continue
 
         if isinstance(event, ProcessSignal):
@@ -318,6 +344,15 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
 
         name = syscall.name
         if name in WATCHED_SYSCALLS:
+            # Child process memory can't be read reliably — skip but log
+            # Exception: exec calls are important to approve regardless of pid
+            if proc.pid != initial_pid and name not in ("execve", "execveat"):
+                if debug:
+                    print(f"  {CYAN}skip: pid {proc.pid} (initial {initial_pid}) ({_proc_cmdline(proc.pid)}) {name}{RESET}")
+                try: proc.syscall()
+                except Exception: pass
+                continue
+
             if strace_file:
                 try:
                     pid = proc.pid
@@ -325,7 +360,6 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
                 except Exception:
                     fmt = name
                     pid = "?"
-
             try:
                 desc = WATCHED_SYSCALLS[name](syscall.arguments, proc)
             except Exception:
@@ -349,23 +383,41 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
             allow_patterns = get_patterns(profiles, app_key)
             deny_patterns  = get_patterns(profiles, app_key + ":deny")
 
-            if matches_any(deny_patterns, desc):
+            deny_rule = find_match(deny_patterns, desc)
+            if deny_rule is not None:
                 print(f"\n{RED}✗ auto-denied: {desc}{RESET}")
+                if debug:
+                    print(f"  {CYAN}rule: {deny_rule}{RESET}")
                 _deny_syscall(proc)
                 continue
 
-            if matches_any(allow_patterns, desc):
+            allow_rule = find_match(allow_patterns, desc)
+            if allow_rule is not None:
+                if debug:
+                    print(f"  {GREEN}✓ auto-allowed: {desc}{RESET}")
+                    print(f"  {CYAN}rule: {allow_rule}{RESET}")
                 try: proc.syscall()
                 except Exception: pass
                 continue
 
             if no_prompt:
+                if debug:
+                    print(f"  {YELLOW}? no matching rule: {desc}{RESET}")
                 print(f"\n{RED}✗ denied (no profile match): {desc}{RESET}")
                 _deny_syscall(proc)
                 continue
 
+            if debug:
+                print(f"  {YELLOW}? no matching rule: {desc}{RESET}")
+
             allowed = prompt_user(desc, app_key, profiles)
-            if allowed:
+            if allowed is None:
+                # quit — kill the child and bail
+                exit_code = 130
+                try: proc.kill(9)
+                except Exception: pass
+                break
+            elif allowed:
                 try: proc.syscall()
                 except Exception: pass
             else:
@@ -406,6 +458,25 @@ def clear_profile(app_key: str):
     else:
         print(f"No profile found for {resolved}")
 
+def show_rules(app_key: str):
+    import shutil
+    resolved = shutil.which(app_key) or app_key
+    profiles = load_profiles()
+    allow = get_patterns(profiles, resolved)
+    deny = get_patterns(profiles, resolved + ":deny")
+    if not allow and not deny:
+        print(f"No rules for {resolved}")
+    else:
+        print(f"{BOLD}{resolved}{RESET}")
+        if allow:
+            print(f"\n  {GREEN}allow:{RESET}")
+            for p in allow:
+                print(f"    {p}")
+        if deny:
+            print(f"\n  {RED}deny:{RESET}")
+            for p in deny:
+                print(f"    {p}")
+
 def list_profiles():
     profiles = load_profiles()
     if not profiles:
@@ -429,6 +500,8 @@ def main():
                         help="Clear saved profile for the command before running it")
     parser.add_argument("--list", action="store_true",
                         help="List all saved profiles")
+    parser.add_argument("--rules", metavar="APP",
+                        help="Show saved rules for APP")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress startup messages")
     parser.add_argument("-P", "--no-prompt", action="store_true",
@@ -437,6 +510,8 @@ def main():
                         help="Log all watched syscalls as descriptions and allow everything — no prompts, no profile")
     parser.add_argument("--strace", metavar="FILE",
                         help="Log watched syscalls in strace format to FILE and allow everything — for debugging")
+    parser.add_argument("--debug", action="store_true",
+                        help="Show every approved/denied syscall and the rule that matched")
     args = parser.parse_args()
 
     if args.list:
@@ -445,6 +520,10 @@ def main():
 
     if args.clear:
         clear_profile(args.clear)
+        return
+
+    if args.rules:
+        show_rules(args.rules)
         return
 
     if not args.cmd:
@@ -479,17 +558,31 @@ def main():
         else:
             print(f"{CYAN}ptrace-approve{RESET}: watching {BOLD}{' '.join(args.cmd)}{RESET}")
             print(f"Profile: {app_key}")
-            patterns = get_patterns(profiles, app_key)
-            if patterns:
-                print(f"Loaded {len(patterns)} allow pattern(s)")
+            allow = get_patterns(profiles, app_key)
+            deny = get_patterns(profiles, app_key + ":deny")
+            if args.debug:
+                if allow:
+                    print(f"  {GREEN}allow ({len(allow)}):{RESET}")
+                    for p in allow:
+                        print(f"    {p}")
+                if deny:
+                    print(f"  {RED}deny ({len(deny)}):{RESET}")
+                    for p in deny:
+                        print(f"    {p}")
+                if not allow and not deny:
+                    print(f"  (no rules)")
+            else:
+                if allow:
+                    print(f"Loaded {len(allow)} allow pattern(s)")
         print()
 
     strace_file = open(args.strace, "w") if args.strace else None
     try:
-        exit_code = run(args.cmd, app_key, profiles, no_prompt=args.no_prompt, log_only=args.log_only, strace_file=strace_file)
+        exit_code = run(args.cmd, app_key, profiles, no_prompt=args.no_prompt, log_only=args.log_only, strace_file=strace_file, debug=args.debug)
     finally:
         if strace_file:
             strace_file.close()
+
     sys.exit(exit_code)
 
 if __name__ == "__main__":

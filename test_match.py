@@ -1,13 +1,10 @@
 """Tests for ptrace_approve.match"""
-
 import pytest
 from ptrace_approve.match import parse, match, matches_any, _match_leaf, _tokenize
-
 
 # ---------------------------------------------------------------------------
 # Tokenizer
 # ---------------------------------------------------------------------------
-
 class TestTokenize:
     def test_simple(self):
         assert _tokenize("exec(/bin/true)") == ["exec", "(", "/bin/true", ")"]
@@ -33,11 +30,37 @@ class TestTokenize:
             "open", "(", "/tmp/f", ",", "create+write", ")"
         ]
 
+    def test_quoted_string(self):
+        assert _tokenize("exec(/bin/ssh, [ssh, host, 'cd foo && git status'])") == [
+            "exec", "(", "/bin/ssh", ",", "[", "ssh", ",", "host", ",",
+            "cd foo && git status", "]", ")"
+        ]
+
+    def test_double_quoted_string(self):
+        assert _tokenize('exec(/bin/sh, [sh, -c, "echo hello world"])') == [
+            "exec", "(", "/bin/sh", ",", "[", "sh", ",", "-c", ",",
+            "echo hello world", "]", ")"
+        ]
+
+    def test_regex_with_spaces(self):
+        tokens = _tokenize("exec(**/ssh, [ssh, _, /cd mine && git rev-parse/])")
+        assert "/cd mine && git rev-parse/" in tokens
+
+    def test_regex_no_spaces(self):
+        assert _tokenize("exec(//bin/tr.+/, ...)") == [
+            "exec", "(", "//bin/tr.+/", ",", "...", ")"
+        ]
+
+    def test_path_not_mistaken_for_regex(self):
+        # /usr/bin/ssh has slashes but the closing / is followed by more path,
+        # not a delimiter — so it stays a bare string
+        tokens = _tokenize("exec(/usr/bin/ssh)")
+        assert tokens == ["exec", "(", "/usr/bin/ssh", ")"]
+
 
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
-
 class TestParse:
     def test_simple_call(self):
         assert parse("delete(/tmp/junk)") == ("delete", ["/tmp/junk"])
@@ -66,11 +89,15 @@ class TestParse:
     def test_rename(self):
         assert parse("rename(/old -> /new)") == ("rename", ["/old", "->", "/new"])
 
+    def test_quoted_arg(self):
+        name, args = parse("exec(/bin/ssh, [ssh, host, 'cd foo && bar'])")
+        assert name == "exec"
+        assert args == ["/bin/ssh", ["ssh", "host", "cd foo && bar"]]
+
 
 # ---------------------------------------------------------------------------
 # Leaf matching
 # ---------------------------------------------------------------------------
-
 class TestMatchLeaf:
     def test_literal(self):
         assert _match_leaf("write", "write") is True
@@ -112,11 +139,19 @@ class TestMatchLeaf:
         assert _match_leaf("/bin/", "bin") is True
         assert _match_leaf("/bin/", "binary") is False
 
+    def test_regex_with_spaces(self):
+        assert _match_leaf("/cd mine && git rev-parse/", "cd mine && git rev-parse") is True
+        assert _match_leaf("/cd mine && git rev-parse/", "cd other && git rev-parse") is False
+
+    def test_regex_with_spaces_dot(self):
+        # . in regex matches any char
+        assert _match_leaf("/cd .+ && git rev-parse --abbrev-ref HEAD/",
+                           "cd mine/kitty-claude && git rev-parse --abbrev-ref HEAD") is True
+
 
 # ---------------------------------------------------------------------------
 # Full match
 # ---------------------------------------------------------------------------
-
 class TestMatch:
     # --- ellipsis ---
     def test_ellipsis_matches_all(self):
@@ -206,11 +241,39 @@ class TestMatch:
     def test_rename(self):
         assert match("rename(_, ...)", "rename(/old -> /new)") is True
 
+    # --- quoted strings and regex with spaces ---
+    def test_ssh_quoted_command(self):
+        """Quoted args in descriptions match regex patterns with spaces."""
+        desc = "exec(/home/bruger/.local/asdf/bin/ssh, [ssh, gulvmaskine.local, 'cd mine/kitty-claude && git rev-parse --abbrev-ref HEAD'])"
+        pattern = "exec(**/ssh, [ssh, _, /cd mine/kitty-claude && git rev-parse --abbrev-ref HEAD/])"
+        assert match(pattern, desc) is True
+
+    def test_ssh_quoted_command_wildcard_regex(self):
+        """Regex with .+ matches varying paths in quoted ssh commands."""
+        desc = "exec(/home/bruger/.local/asdf/bin/ssh, [ssh, gulvmaskine.local, 'cd mine/kitty-claude && git rev-parse --abbrev-ref HEAD'])"
+        pattern = "exec(**/ssh, [ssh, _, /cd .+ && git rev-parse --abbrev-ref HEAD/])"
+        assert match(pattern, desc) is True
+
+    def test_ssh_quoted_command_no_match(self):
+        """Regex correctly rejects non-matching quoted commands."""
+        desc = "exec(/home/bruger/.local/asdf/bin/ssh, [ssh, gulvmaskine.local, 'cd mine/kitty-claude && git push'])"
+        pattern = "exec(**/ssh, [ssh, _, /cd .+ && git rev-parse --abbrev-ref HEAD/])"
+        assert match(pattern, desc) is False
+
+    def test_ssh_quoted_command_underscore(self):
+        """Underscore matches quoted args with spaces."""
+        desc = "exec(/usr/bin/ssh, [ssh, host, 'cd foo && bar'])"
+        assert match("exec(**/ssh, [ssh, _, _])", desc) is True
+
+    def test_ssh_quoted_command_ellipsis(self):
+        """Ellipsis matches remaining args including quoted ones."""
+        desc = "exec(/usr/bin/ssh, [ssh, host, 'cd foo && bar'])"
+        assert match("exec(**/ssh, ...)", desc) is True
+
 
 # ---------------------------------------------------------------------------
 # matches_any
 # ---------------------------------------------------------------------------
-
 class TestMatchesAny:
     def test_one_matches(self):
         patterns = ["open(_, write)", "exec(...)"]
