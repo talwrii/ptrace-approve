@@ -4,6 +4,7 @@ ptrace-approve: Intercept and approve filesystem-modifying syscalls.
 """
 import argparse
 import json
+import logging
 import os
 import re
 import struct
@@ -19,6 +20,9 @@ from ptrace.tools import signal_to_exitcode
 
 from ptrace_approve.match import matches_any
 
+# Suppress python-ptrace's noisy logging for transient read failures
+logging.getLogger().setLevel(logging.CRITICAL)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -30,17 +34,17 @@ WATCHED_SYSCALLS = {
     # name -> lambda args, proc: description string
     "openat":    lambda a, p: _openat_desc(a),
     "open":      lambda a, p: _open_desc(a),
-    "creat":     lambda a, p: f"create({_str(a,0)})",
-    "unlink":    lambda a, p: f"delete({_str(a,0)})",
-    "unlinkat":  lambda a, p: f"delete({_str(a,1)})",
-    "rename":    lambda a, p: f"rename({_str(a,0)} -> {_str(a,1)})",
-    "renameat":  lambda a, p: f"rename({_str(a,1)} -> {_str(a,3)})",
-    "renameat2": lambda a, p: f"rename({_str(a,1)} -> {_str(a,3)})",
-    "mkdir":     lambda a, p: f"mkdir({_str(a,0)})",
-    "mkdirat":   lambda a, p: f"mkdir({_str(a,1)})",
-    "rmdir":     lambda a, p: f"rmdir({_str(a,0)})",
-    "chmod":     lambda a, p: f"chmod({_str(a,0)}, {_str(a,1)})",
-    "fchmodat":  lambda a, p: f"chmod({_str(a,1)}, {_str(a,2)})",
+    "creat":     lambda a, p: f"create({_str(a,0)})" if _str(a,0) else None,
+    "unlink":    lambda a, p: f"delete({_str(a,0)})" if _str(a,0) else None,
+    "unlinkat":  lambda a, p: f"delete({_str(a,1)})" if _str(a,1) else None,
+    "rename":    lambda a, p: f"rename({_str(a,0)} -> {_str(a,1)})" if _str(a,0) and _str(a,1) else None,
+    "renameat":  lambda a, p: f"rename({_str(a,1)} -> {_str(a,3)})" if _str(a,1) and _str(a,3) else None,
+    "renameat2": lambda a, p: f"rename({_str(a,1)} -> {_str(a,3)})" if _str(a,1) and _str(a,3) else None,
+    "mkdir":     lambda a, p: f"mkdir({_str(a,0)})" if _str(a,0) else None,
+    "mkdirat":   lambda a, p: f"mkdir({_str(a,1)})" if _str(a,1) else None,
+    "rmdir":     lambda a, p: f"rmdir({_str(a,0)})" if _str(a,0) else None,
+    "chmod":     lambda a, p: f"chmod({_str(a,0)}, {_str(a,1)})" if _str(a,0) else None,
+    "fchmodat":  lambda a, p: f"chmod({_str(a,1)}, {_str(a,2)})" if _str(a,1) else None,
     "execve":    lambda a, p: _execve_desc(a, p),
     "execveat":  lambda a, p: _execveat_desc(a, p),
 }
@@ -68,6 +72,7 @@ O_CREAT  = 0x40
 O_TRUNC  = 0x200
 
 def _str(args, i):
+    """Read a string argument from syscall args."""
     try:
         a = args[i]
         t = a.getText()
@@ -77,12 +82,16 @@ def _str(args, i):
         v = a.value
         if isinstance(v, bytes):
             return v.decode(errors='replace')
+        if isinstance(v, int):
+            return None
         return str(v)
     except Exception:
-        return "?"
+        return None
 
 def _openat_desc(args):
-    path  = _str(args, 1)
+    path = _str(args, 1)
+    if path is None:
+        return None
     flags = _get_flags(args, 2)
     if flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC):
         mode = []
@@ -94,7 +103,9 @@ def _openat_desc(args):
     return None  # read-only, skip
 
 def _open_desc(args):
-    path  = _str(args, 0)
+    path = _str(args, 0)
+    if path is None:
+        return None
     flags = _get_flags(args, 1)
     if flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC):
         mode = []
@@ -131,6 +142,8 @@ def _read_argv(proc, addr):
 
 def _execve_desc(args, proc):
     path = _str(args, 0)
+    if path is None:
+        return None
     try:
         argv = _read_argv(proc, args[1].value)
     except Exception:
@@ -139,6 +152,8 @@ def _execve_desc(args, proc):
 
 def _execveat_desc(args, proc):
     path = _str(args, 1)
+    if path is None:
+        return None
     try:
         argv = _read_argv(proc, args[2].value)
     except Exception:
@@ -235,10 +250,10 @@ def prompt_user(description: str, app_key: str, profiles: dict) -> bool:
 # ---------------------------------------------------------------------------
 # Core ptrace loop
 # ---------------------------------------------------------------------------
-def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_only: bool = False):
+def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_only: bool = False, strace_file=None):
     from ptrace.debugger.child import createChild
     debugger = PtraceDebugger()
-    debugger.traceFork()
+    # Don't traceFork — child process memory can't be read reliably via python-ptrace
     debugger.traceExec()
 
     try:
@@ -259,13 +274,11 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
         max_array_count=20,
     )
 
-    from ptrace.debugger.process_event import NewProcessEvent
     from signal import SIGTRAP, SIGSTOP
     SYSCALL_STOP = SIGTRAP | 0x80  # sysgood bit set = syscall-stop
 
     exit_code = 0
-    active = 1
-    while active > 0:
+    while True:
         try:
             event = debugger.waitProcessEvent()
         except Exception:
@@ -273,16 +286,7 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
 
         if isinstance(event, ProcessExit):
             exit_code = event.exitcode or 0
-            active -= 1
-            continue
-
-        if isinstance(event, NewProcessEvent):
-            active += 1
-            try: event.process.syscall()
-            except Exception: pass
-            try: event.process.parent.syscall()
-            except Exception: pass
-            continue
+            break
 
         if isinstance(event, ProcessExecution):
             try: event.process.syscall()
@@ -314,10 +318,22 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
 
         name = syscall.name
         if name in WATCHED_SYSCALLS:
+            if strace_file:
+                try:
+                    pid = proc.pid
+                    fmt = syscall.format()
+                except Exception:
+                    fmt = name
+                    pid = "?"
+
             try:
                 desc = WATCHED_SYSCALLS[name](syscall.arguments, proc)
             except Exception:
-                desc = name
+                desc = None
+
+            if strace_file:
+                strace_file.write(f"[pid {pid}] {fmt}  # {desc}\n")
+                strace_file.flush()
 
             if desc is None:
                 try: proc.syscall()
@@ -419,6 +435,8 @@ def main():
                         help="Only use saved profile — deny anything not matched, no interactive prompts")
     parser.add_argument("--log-only", action="store_true",
                         help="Log all watched syscalls as descriptions and allow everything — no prompts, no profile")
+    parser.add_argument("--strace", metavar="FILE",
+                        help="Log watched syscalls in strace format to FILE and allow everything — for debugging")
     args = parser.parse_args()
 
     if args.list:
@@ -452,6 +470,12 @@ def main():
     if not args.quiet:
         if args.log_only:
             print(f"{CYAN}ptrace-approve{RESET}: logging {BOLD}{' '.join(args.cmd)}{RESET} (all allowed)")
+        elif args.strace:
+            print(f"{CYAN}ptrace-approve{RESET}: watching {BOLD}{' '.join(args.cmd)}{RESET} (strace → {args.strace})")
+            print(f"Profile: {app_key}")
+            patterns = get_patterns(profiles, app_key)
+            if patterns:
+                print(f"Loaded {len(patterns)} allow pattern(s)")
         else:
             print(f"{CYAN}ptrace-approve{RESET}: watching {BOLD}{' '.join(args.cmd)}{RESET}")
             print(f"Profile: {app_key}")
@@ -460,7 +484,12 @@ def main():
                 print(f"Loaded {len(patterns)} allow pattern(s)")
         print()
 
-    exit_code = run(args.cmd, app_key, profiles, no_prompt=args.no_prompt, log_only=args.log_only)
+    strace_file = open(args.strace, "w") if args.strace else None
+    try:
+        exit_code = run(args.cmd, app_key, profiles, no_prompt=args.no_prompt, log_only=args.log_only, strace_file=strace_file)
+    finally:
+        if strace_file:
+            strace_file.close()
     sys.exit(exit_code)
 
 if __name__ == "__main__":
