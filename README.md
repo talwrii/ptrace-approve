@@ -8,7 +8,7 @@ This is ai-generated unreviewed code. I have used it a coouple of times.
 ## Caveats
 AI-generated code, unreviewed, *slow*. This runs python code on every system call so for some use cases is *very slow* and breaks parallelization, think lots of system calls in parallel threads.
 
-Child processes and not traced (`strace -f`) (but you approve when the are spawned).
+Processes and not traced after an exec (`--trace-children`), but you will have approved the exec. I had issues getting filenames (due to not being able to access memory) when we exec'd into other processes. This specifically happened for git. But this is not the normal mode of execution.
 
 ## Motivation
 I wanted to rub some vibe coded apps over my code and not have it destroy my code.
@@ -44,7 +44,6 @@ Patterns
 _ - any argument
 
 
-
 ## Change log
-
 2.0.0 - Change match format
+3.0.0 - Don't trace after exec, but trace after the initial fork.
