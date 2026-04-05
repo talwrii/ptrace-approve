@@ -212,13 +212,22 @@ def input_with_default(prompt: str, default: str) -> str:
         line = sys.stdin.readline().strip()
         return line if line else default
 
-def prompt_user(description: str, app_key: str, profiles: dict):
-    """Ask the user what to do. Returns True to allow, False to deny, None to quit."""
-    print(f"\n{BOLD}{YELLOW}⚡ {description}{RESET}")
+def prompt_user(description: str, app_key: str, profiles: dict, pid: int = None, initial_pid: int = None):
+    """Ask the user what to do. Returns True to allow, False to deny, None to quit, 'trust' to trust pid."""
+    if pid is not None and initial_pid is not None:
+        chain = _proc_chain(pid, initial_pid)
+        print(f"\n{BOLD}{YELLOW}⚡ {description}{RESET}")
+        print(f"  {CYAN}{chain}{RESET}")
+    elif pid is not None:
+        print(f"\n{BOLD}{YELLOW}⚡ {description}{RESET} {CYAN}(pid {pid}){RESET}")
+    else:
+        print(f"\n{BOLD}{YELLOW}⚡ {description}{RESET}")
     print(f"  {CYAN}[a]{RESET} approve once   "
           f"{CYAN}[p]{RESET} add pattern   "
+          f"{CYAN}[c]{RESET} allow child   "
           f"{CYAN}[d]{RESET} deny once   "
-          f"{CYAN}[D]{RESET} deny + pattern   "
+          f"{CYAN}[D]{RESET} deny + pattern")
+    print(f"  {CYAN}[t]{RESET} tree   "
           f"{CYAN}[q]{RESET} quit")
     while True:
         try:
@@ -236,6 +245,12 @@ def prompt_user(description: str, app_key: str, profiles: dict):
             save_profiles(profiles)
             print(f"  {GREEN}✓ pattern saved, allowed{RESET}")
             return True
+        elif ch == 'c':
+            if pid is not None:
+                print(f"  {GREEN}✓ pid {pid} trusted for this session{RESET}")
+                return 'trust'
+            else:
+                print(f"  {YELLOW}(no pid info){RESET}")
         elif ch == 'd':
             print(f"  {RED}✗ denied{RESET}")
             return False
@@ -245,11 +260,16 @@ def prompt_user(description: str, app_key: str, profiles: dict):
             save_profiles(profiles)
             print(f"  {RED}✗ deny pattern saved{RESET}")
             return False
+        elif ch == 't':
+            if pid is not None:
+                print(f"  {CYAN}{_proc_chain(pid)}{RESET}")
+            else:
+                print(f"  {YELLOW}(no pid info){RESET}")
         elif ch == 'q':
             print(f"  {RED}quit{RESET}")
             return None
         else:
-            print(f"  Use a/p/d/D/q")
+            print(f"  Use a/p/c/d/D/t/q")
 
 # ---------------------------------------------------------------------------
 # Core ptrace loop
@@ -262,7 +282,31 @@ def _proc_cmdline(pid):
     except Exception:
         return "?"
 
-def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_only: bool = False, strace_file=None, debug: bool = False):
+def _proc_ppid(pid):
+    """Read parent pid from /proc."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.split(') ')[1].split()[1])
+    except Exception:
+        return None
+
+def _proc_chain(pid, stop_pid=None):
+    """Build ancestry chain: pid(cmd) ← ppid(cmd) ← ... stopping at stop_pid or init."""
+    parts = []
+    seen = set()
+    current = pid
+    while current and current > 1 and current not in seen:
+        seen.add(current)
+        cmd = _proc_cmdline(current)
+        # shorten to just the binary name
+        short = cmd.split()[0].rsplit('/', 1)[-1] if cmd and cmd != '?' else '?'
+        parts.append(f"{current}({short})")
+        if current == stop_pid:
+            break
+        current = _proc_ppid(current)
+    return ' ← '.join(parts)
+
+def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_only: bool = False, strace_file=None, debug: bool = False, trace_children: bool = False):
     from ptrace.debugger.child import createChild
     debugger = PtraceDebugger()
     debugger.traceFork()
@@ -278,6 +322,9 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
 
     if debug:
         print(f"{CYAN}initial pid: {initial_pid}{RESET}")
+
+    trusted_pids = set()
+    own_pids = {initial_pid}  # pids that forked from us but haven't exec'd
 
     process.syscall()
     syscall_options = FunctionCallOptions(
@@ -300,6 +347,8 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
             break
 
         if isinstance(event, ProcessExit):
+            own_pids.discard(event.process.pid)
+            trusted_pids.discard(event.process.pid)
             if event.process.pid == initial_pid:
                 exit_code = event.exitcode or 0
                 break
@@ -307,15 +356,36 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
                 continue
 
         if isinstance(event, ProcessExecution):
-            try: event.process.syscall()
+            proc = event.process
+            if proc.pid != initial_pid:
+                own_pids.discard(proc.pid)
+                if not trace_children:
+                    # exec'd — we approved it, now let it run free
+                    if debug:
+                        print(f"  {CYAN}detach: pid {proc.pid} exec'd ({_proc_cmdline(proc.pid)}){RESET}")
+                    try: proc.detach()
+                    except Exception: pass
+                    continue
+                else:
+                    if debug:
+                        print(f"  {CYAN}exec: pid {proc.pid} left own_pids ({_proc_cmdline(proc.pid)}){RESET}")
+            try: proc.syscall()
             except Exception: pass
             continue
 
         if isinstance(event, NewProcessEvent):
-            try: event.process.syscall()
+            new_proc = event.process
+            # child inherits "own" status from parent
+            if new_proc.parent is not None and new_proc.parent.pid in own_pids:
+                own_pids.add(new_proc.pid)
+                if debug:
+                    print(f"  {CYAN}fork: pid {new_proc.pid} added to own_pids (parent {new_proc.parent.pid}){RESET}")
+            elif debug:
+                print(f"  {CYAN}fork: pid {new_proc.pid} (child, not own){RESET}")
+            try: new_proc.syscall()
             except Exception: pass
-            if event.process.parent is not None:
-                try: event.process.parent.syscall()
+            if new_proc.parent is not None:
+                try: new_proc.parent.syscall()
                 except Exception: pass
             continue
 
@@ -345,10 +415,12 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
         name = syscall.name
         if name in WATCHED_SYSCALLS:
             # Child process memory can't be read reliably — skip but log
+            # own_pids: forked from us but not yet exec'd — treat as ours
             # Exception: exec calls are important to approve regardless of pid
-            if proc.pid != initial_pid and name not in ("execve", "execveat"):
+            # With -f/--trace-children: approve everything from all pids
+            if not trace_children and proc.pid not in own_pids and name not in ("execve", "execveat"):
                 if debug:
-                    print(f"  {CYAN}skip: pid {proc.pid} (initial {initial_pid}) ({_proc_cmdline(proc.pid)}) {name}{RESET}")
+                    print(f"  {CYAN}skip: pid {proc.pid} ({_proc_cmdline(proc.pid)}) {name}{RESET}")
                 try: proc.syscall()
                 except Exception: pass
                 continue
@@ -380,6 +452,14 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
                 except Exception: pass
                 continue
 
+            # Trusted child — previously approved with 'c'
+            if proc.pid in trusted_pids:
+                if debug:
+                    print(f"  {GREEN}✓ trusted child (pid {proc.pid}): {desc}{RESET}")
+                try: proc.syscall()
+                except Exception: pass
+                continue
+
             allow_patterns = get_patterns(profiles, app_key)
             deny_patterns  = get_patterns(profiles, app_key + ":deny")
 
@@ -387,14 +467,14 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
             if deny_rule is not None:
                 print(f"\n{RED}✗ auto-denied: {desc}{RESET}")
                 if debug:
-                    print(f"  {CYAN}rule: {deny_rule}{RESET}")
+                    print(f"  {CYAN}pid: {proc.pid}  rule: {deny_rule}{RESET}")
                 _deny_syscall(proc)
                 continue
 
             allow_rule = find_match(allow_patterns, desc)
             if allow_rule is not None:
                 if debug:
-                    print(f"  {GREEN}✓ auto-allowed: {desc}{RESET}")
+                    print(f"  {GREEN}✓ auto-allowed (pid {proc.pid}): {desc}{RESET}")
                     print(f"  {CYAN}rule: {allow_rule}{RESET}")
                 try: proc.syscall()
                 except Exception: pass
@@ -402,21 +482,25 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
 
             if no_prompt:
                 if debug:
-                    print(f"  {YELLOW}? no matching rule: {desc}{RESET}")
+                    print(f"  {YELLOW}? no matching rule (pid {proc.pid}): {desc}{RESET}")
                 print(f"\n{RED}✗ denied (no profile match): {desc}{RESET}")
                 _deny_syscall(proc)
                 continue
 
             if debug:
-                print(f"  {YELLOW}? no matching rule: {desc}{RESET}")
+                print(f"  {YELLOW}? no matching rule (pid {proc.pid}): {desc}{RESET}")
 
-            allowed = prompt_user(desc, app_key, profiles)
+            allowed = prompt_user(desc, app_key, profiles, pid=proc.pid, initial_pid=initial_pid if debug else None)
             if allowed is None:
                 # quit — kill the child and bail
                 exit_code = 130
                 try: proc.kill(9)
                 except Exception: pass
                 break
+            elif allowed == 'trust':
+                trusted_pids.add(proc.pid)
+                try: proc.syscall()
+                except Exception: pass
             elif allowed:
                 try: proc.syscall()
                 except Exception: pass
@@ -512,6 +596,8 @@ def main():
                         help="Log watched syscalls in strace format to FILE and allow everything — for debugging")
     parser.add_argument("--debug", action="store_true",
                         help="Show every approved/denied syscall and the rule that matched")
+    parser.add_argument("-f", "--trace-children", action="store_true",
+                        help="Require approval for all children's syscalls, not just exec")
     args = parser.parse_args()
 
     if args.list:
@@ -578,7 +664,7 @@ def main():
 
     strace_file = open(args.strace, "w") if args.strace else None
     try:
-        exit_code = run(args.cmd, app_key, profiles, no_prompt=args.no_prompt, log_only=args.log_only, strace_file=strace_file, debug=args.debug)
+        exit_code = run(args.cmd, app_key, profiles, no_prompt=args.no_prompt, log_only=args.log_only, strace_file=strace_file, debug=args.debug, trace_children=args.trace_children)
     finally:
         if strace_file:
             strace_file.close()
