@@ -15,6 +15,7 @@ text = "MIT"
 
 [project.scripts]
 ptrace-approve = "ptrace_approve.main:main"
+ptrace-pipx = "ptrace_approve.pipx:main"
 
 [tool.setuptools.packages.find]
 where = [ ".",]

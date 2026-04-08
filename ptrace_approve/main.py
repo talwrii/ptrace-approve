@@ -598,6 +598,8 @@ def main():
                         help="Show every approved/denied syscall and the rule that matched")
     parser.add_argument("-f", "--trace-children", action="store_true",
                         help="Require approval for all children's syscalls, not just exec")
+    parser.add_argument("--profile", metavar="NAME",
+                        help="Use NAME as the profile key instead of the resolved binary path")
     args = parser.parse_args()
 
     if args.list:
@@ -618,7 +620,7 @@ def main():
 
     import shutil
     binary = shutil.which(args.cmd[0]) or args.cmd[0]
-    app_key = binary
+    app_key = args.profile or binary
     profiles = load_profiles()
 
     if args.clear_run:

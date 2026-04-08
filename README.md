@@ -24,9 +24,9 @@ Tools like austral can place limits at the module or function level using a type
 pipx install ptrace-approve
 
 ## Usage
-ptrace-approve app
+` ptrace-approve app`
 
-By default all reads are allowed.
+By default all reads are allowed for `app`
 
 Individually approve rules or add patterns. `.` in patterns does not match ,'s or brackets. Use `(.|[.(),])` for the conventional meaning of . in regexps
 
@@ -34,14 +34,17 @@ the abolsute path to app app is found and a default profile is stored for the ap
 
 ptrace-approve --clear app
 
-Patterns 
+Here are some patterns:
 
-/regexp/
-**/__pycache__/*
-`*` does not match forwards slashes
+`/regexp/` `/` which the regexp work - the regexp is determined by commas or forward slashes.
+`**/__pycache__/*` 
+`*` does not match forwards slashes, `**` matches forward slashses.
 "*" - literal
-...
+... - remaining arguments
 _ - any argument
+
+To always use `ptrace-approve` with a python app you can use `ptrace-pipx install app`
+
 
 
 ## Change log
