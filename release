@@ -3,6 +3,9 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+# Run tests before doing anything destructive.
+./test
+
 git push
 
 # Extract version from pyproject.toml if it exists, otherwise fall back to setup.py

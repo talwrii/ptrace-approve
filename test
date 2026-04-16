@@ -1,0 +1,17 @@
+#!/bin/bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# Run all tests. Exits non-zero on any failure.
+cd "$(dirname "$0")"
+
+# Use the pipx venv's pytest so `ptrace_approve` is importable.
+PYTEST="$HOME/.local/share/pipx/venvs/ptrace-approve/bin/pytest"
+if [ ! -x "$PYTEST" ]; then
+    echo "error: pytest not found at $PYTEST" >&2
+    echo "install with: pipx inject ptrace-approve pytest" >&2
+    exit 1
+fi
+
+exec "$PYTEST" -v test_match.py test_background.py "$@"

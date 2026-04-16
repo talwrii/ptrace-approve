@@ -78,7 +78,7 @@ def rewrite_shebang(script_path):
     # Use the script's absolute path as the profile (don't follow symlinks)
     profile_name = str(path.absolute())
     
-    new_shebang = f"#!/usr/bin/env -S ptrace-approve --profile {profile_name} {interpreter}\n"
+    new_shebang = f"#!/usr/bin/env -S ptrace-approve --profile {profile_name} -- {interpreter}\n"
     
     with open(path, "wb") as f:
         f.write(new_shebang.encode("utf-8"))
@@ -110,7 +110,7 @@ def unwrap_shebang(script_path):
     
     # #!/usr/bin/env -S ptrace-approve --profile NAME /path/to/python -> #!/path/to/python
     import re
-    interpreter = re.sub(r'^#!/usr/bin/env -S ptrace-approve\s+(--profile\s+\S+\s+)?', '#!', shebang)
+    interpreter = re.sub(r'^#!/usr/bin/env -S ptrace-approve\s+(--profile\s+\S+\s+)?(--\s+)?', '#!', shebang)
     
     with open(path, "wb") as f:
         f.write(f"{interpreter}\n".encode("utf-8"))

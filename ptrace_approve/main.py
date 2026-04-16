@@ -212,8 +212,16 @@ def input_with_default(prompt: str, default: str) -> str:
         line = sys.stdin.readline().strip()
         return line if line else default
 
+class NoBlockError(Exception):
+    """Raised when prompt_user would block but PTAPP_NO_BLOCK is set."""
+    def __init__(self, description: str):
+        self.description = description
+        super().__init__(description)
+
 def prompt_user(description: str, app_key: str, profiles: dict, pid: int = None, initial_pid: int = None):
     """Ask the user what to do. Returns True to allow, False to deny, None to quit, 'trust' to trust pid."""
+    if os.environ.get("PTAPP_NO_BLOCK"):
+        raise NoBlockError(description)
     if pid is not None and initial_pid is not None:
         chain = _proc_chain(pid, initial_pid)
         print(f"\n{BOLD}{YELLOW}⚡ {description}{RESET}")
@@ -272,6 +280,153 @@ def prompt_user(description: str, app_key: str, profiles: dict, pid: int = None,
             print(f"  Use a/p/c/d/D/t/q")
 
 # ---------------------------------------------------------------------------
+# Background (file-based) approval
+# ---------------------------------------------------------------------------
+import time as _time
+
+_background_seq = 0
+
+def _background_approve(description: str, app_key: str, profiles: dict, background_dir: str, pid: int = None):
+    """Write a pending approval request and block until a matching response appears."""
+    global _background_seq
+    _background_seq += 1
+    seq = _background_seq
+
+    bg = Path(background_dir)
+    pending = bg / "pending.json"
+    response = bg / "response.json"
+
+    request = {
+        "seq": seq,
+        "description": description,
+        "app_key": app_key,
+        "pid": pid,
+    }
+    # Atomic write: tmp then rename
+    tmp = bg / "pending.tmp"
+    tmp.write_text(json.dumps(request, indent=2))
+    tmp.rename(pending)
+
+    # Block until a response with matching seq appears
+    while True:
+        if response.exists():
+            try:
+                resp = json.loads(response.read_text())
+            except (json.JSONDecodeError, OSError):
+                _time.sleep(0.1)
+                continue
+
+            if resp.get("seq") != seq:
+                # Stale response — ignore
+                _time.sleep(0.1)
+                continue
+
+            pending.unlink(missing_ok=True)
+            response.unlink(missing_ok=True)
+
+            action = resp.get("action", "deny")
+            if action == "approve":
+                return True
+            elif action == "pattern":
+                pattern = resp.get("pattern", description)
+                add_pattern(profiles, app_key, pattern)
+                save_profiles(profiles)
+                return True
+            elif action == "trust":
+                return "trust"
+            elif action == "deny":
+                return False
+            elif action == "deny_pattern":
+                pattern = resp.get("pattern", description)
+                add_pattern(profiles, app_key + ":deny", pattern)
+                save_profiles(profiles)
+                return False
+            elif action == "quit":
+                return None
+            else:
+                return False
+        _time.sleep(0.2)
+
+def background_respond(background_dir: str, seq: int, action: str, pattern: str = None):
+    """Write a response file, then wait for the process to finish or need approval again.
+    Prints JSON status. If process finishes, exits with the process's exit code.
+    If another approval is needed, exits 0.
+    """
+    bg = Path(background_dir)
+    response = bg / "response.json"
+    resp = {"seq": seq, "action": action}
+    if pattern is not None:
+        resp["pattern"] = pattern
+    tmp = bg / "response.tmp"
+    tmp.write_text(json.dumps(resp, indent=2))
+    tmp.rename(response)
+
+    # Now wait for the next event (pending or done)
+    pending = bg / "pending.json"
+    done_file = bg / "done.json"
+
+    while True:
+        # Check done first — if the process finished, we don't want to report
+        # a stale pending.json
+        if done_file.exists():
+            try:
+                data = json.loads(done_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                _time.sleep(0.2)
+                continue
+            data["status"] = "done"
+            print(json.dumps(data))
+            sys.exit(data.get("exit_code", 0))
+
+        if pending.exists():
+            try:
+                data = json.loads(pending.read_text())
+            except (json.JSONDecodeError, OSError):
+                _time.sleep(0.2)
+                continue
+            # Only report pending if it's newer than the seq we just responded to
+            if data.get("seq", 0) <= seq:
+                _time.sleep(0.2)
+                continue
+            data["status"] = "pending"
+            print(json.dumps(data))
+            return
+
+        _time.sleep(0.2)
+
+def background_wait(background_dir: str):
+    """Block until the background process needs approval or is done.
+    Always exits 0. Prints JSON with either {"status": "pending", "seq": ..., ...}
+    or {"status": "done", "exit_code": ...}.
+    """
+    bg = Path(background_dir)
+    pending = bg / "pending.json"
+    done_file = bg / "done.json"
+
+    while True:
+        if pending.exists():
+            try:
+                data = json.loads(pending.read_text())
+            except (json.JSONDecodeError, OSError):
+                _time.sleep(0.2)
+                continue
+            data["status"] = "pending"
+            print(json.dumps(data))
+            return
+
+        if done_file.exists():
+            try:
+                data = json.loads(done_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                _time.sleep(0.2)
+                continue
+            data["status"] = "done"
+            print(json.dumps(data))
+            return
+
+        _time.sleep(0.2)
+
+# ---------------------------------------------------------------------------
 # Core ptrace loop
 # ---------------------------------------------------------------------------
 def _proc_cmdline(pid):
@@ -306,7 +461,7 @@ def _proc_chain(pid, stop_pid=None):
         current = _proc_ppid(current)
     return ' ← '.join(parts)
 
-def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_only: bool = False, strace_file=None, debug: bool = False, trace_children: bool = False):
+def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_only: bool = False, strace_file=None, debug: bool = False, trace_children: bool = False, background_dir: str = None):
     from ptrace.debugger.child import createChild
     debugger = PtraceDebugger()
     debugger.traceFork()
@@ -490,7 +645,23 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
             if debug:
                 print(f"  {YELLOW}? no matching rule (pid {proc.pid}): {desc}{RESET}")
 
-            allowed = prompt_user(desc, app_key, profiles, pid=proc.pid, initial_pid=initial_pid if debug else None)
+            try:
+                if background_dir:
+                    allowed = _background_approve(desc, app_key, profiles, background_dir, pid=proc.pid)
+                else:
+                    allowed = prompt_user(desc, app_key, profiles, pid=proc.pid, initial_pid=initial_pid if debug else None)
+            except NoBlockError as e:
+                # PTAPP_NO_BLOCK is set — kill the whole tree and exit 3
+                print(f"{RED}ERROR: ptrace-approve needs approval for: {e.description}{RESET}", file=sys.stderr)
+                print(f"  PTAPP_NO_BLOCK is set. Re-run with --background-dir DIR (see --help).", file=sys.stderr)
+                try:
+                    for p in list(debugger):
+                        try: p.kill(9)
+                        except Exception: pass
+                except Exception: pass
+                try: debugger.quit()
+                except Exception: pass
+                sys.exit(3)
             if allowed is None:
                 # quit — kill the child and bail
                 exit_code = 130
@@ -512,6 +683,11 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
 
     try: debugger.quit()
     except Exception: pass
+
+    if background_dir:
+        done_file = Path(background_dir) / "done.json"
+        done_file.write_text(json.dumps({"exit_code": exit_code}))
+
     return exit_code
 
 def _deny_syscall(proc):
@@ -575,7 +751,30 @@ def list_profiles():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Intercept and approve filesystem-modifying syscalls."
+        description="Intercept and approve filesystem-modifying syscalls.",
+        epilog="""Background mode (for non-interactive callers, e.g. Claude Code):
+
+  Set PTAPP_NO_BLOCK=1 in the environment so interactive prompts exit 3 with an
+  error instead of hanging on stdin.
+
+  Three commands form the protocol:
+
+    1. Start in background:
+         ptrace-approve --background-dir DIR -- COMMAND &
+
+    2. Wait for next event:
+         ptrace-approve --background-wait DIR
+       prints JSON: {"status": "pending", "seq": N, "description": ...}
+                 or {"status": "done",    "exit_code": N}
+
+    3. Respond to a pending approval and wait for next event:
+         ptrace-approve --background-respond DIR SEQ ACTION
+       ACTION: approve | pattern | trust | deny | deny_pattern | quit
+       Add --background-pattern PATTERN for pattern/deny_pattern actions.
+
+  Loop step 3 until status is "done". Exits with the subprocess's exit code.
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("cmd", nargs="*", help="Command to run")
     parser.add_argument("--clear", metavar="APP",
@@ -600,7 +799,24 @@ def main():
                         help="Require approval for all children's syscalls, not just exec")
     parser.add_argument("--profile", metavar="NAME",
                         help="Use NAME as the profile key instead of the resolved binary path")
+    parser.add_argument("--background-dir", metavar="DIR",
+                        help="Run in background mode: write approval requests to DIR instead of prompting")
+    parser.add_argument("--background-wait", metavar="DIR",
+                        help="Wait for a background process in DIR to need approval or finish")
+    parser.add_argument("--background-respond", nargs=3, metavar=("DIR", "SEQ", "ACTION"),
+                        help="Respond to a pending approval: DIR SEQ ACTION (approve/pattern/trust/deny/deny_pattern/quit)")
+    parser.add_argument("--background-pattern", metavar="PATTERN",
+                        help="Pattern to use with --background-respond pattern/deny_pattern actions")
     args = parser.parse_args()
+
+    if args.background_wait:
+        background_wait(args.background_wait)
+        return
+
+    if args.background_respond:
+        bg_dir, seq_str, action = args.background_respond
+        background_respond(bg_dir, int(seq_str), action, pattern=args.background_pattern)
+        return
 
     if args.list:
         list_profiles()
@@ -664,9 +880,13 @@ def main():
                     print(f"Loaded {len(allow)} allow pattern(s)")
         print()
 
+    bg_dir = args.background_dir
+    if bg_dir:
+        Path(bg_dir).mkdir(parents=True, exist_ok=True)
+
     strace_file = open(args.strace, "w") if args.strace else None
     try:
-        exit_code = run(args.cmd, app_key, profiles, no_prompt=args.no_prompt, log_only=args.log_only, strace_file=strace_file, debug=args.debug, trace_children=args.trace_children)
+        exit_code = run(args.cmd, app_key, profiles, no_prompt=args.no_prompt, log_only=args.log_only, strace_file=strace_file, debug=args.debug, trace_children=args.trace_children, background_dir=bg_dir)
     finally:
         if strace_file:
             strace_file.close()
