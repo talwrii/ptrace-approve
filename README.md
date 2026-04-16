@@ -45,6 +45,45 @@ _ - any argument
 
 To always use `ptrace-approve` with a python app you can use `ptrace-pipx install app`
 
+You can run the executable one the clipboard with `ptrace-clip`
+
+
+## Running non-interactively
+
+`ptapp` (ptrace-approve) is meant to make it *easy* to sandbox processes
+for easy things. A common case is command-line tools, which works well —
+you are prompted for options directly in the shell.
+
+But some programs don't run in the shell. For those, we provide a
+programmatic mode where another process can monitor what is going on and
+make approval decisions. This was specifically written with execution from
+Claude Code in mind.
+
+If you are using an LLM (or any non-interactive caller), set
+`PTAPP_NO_BLOCK=1` in its environment so you can't accidentally run
+`ptapp` in blocking mode — it will exit 3 with an error instead of
+hanging silently on a prompt.
+
+For Claude Code, put this in `settings.json`:
+
+    {
+      "env": {
+        "PTAPP_NO_BLOCK": "1"
+      }
+    }
+
+To run non-interactively you use `--background-dir` (`PTAPP_NO_BLOCK`
+makes this mandatory). Using this you start a process in the background
+and can then query it to see if it requires permissions. See
+`ptrace-approve --help` for the full protocol:
+
+    ptrace-approve --background-dir DIR -- CMD &    # start
+    ptrace-approve --background-wait DIR            # block until next event
+    ptrace-approve --background-respond DIR SEQ ACT # reply, wait for next
+
+Events are JSON (`{"status": "pending", "seq": N, ...}` or
+`{"status": "done", "exit_code": N}`). `--background-respond` exits with
+the subprocess's exit code when the run finishes.
 
 
 ## Change log
