@@ -27,6 +27,14 @@ Special tokens:
 
 import re
 
+
+class QuotedStr(str):
+    """A string token that came from a quoted literal in the pattern.
+    Matches are always literal — no regex, no glob, no /X/ interpretation.
+    """
+    __slots__ = ()
+
+
 # ---------------------------------------------------------------------------
 # Parser — turns "exec(/bin/true, [a, b])" into ("exec", ["/bin/true", ["a", "b"]])
 # ---------------------------------------------------------------------------
@@ -55,19 +63,23 @@ def _tokenize(s):
             j = i + 1
             while j < len(s) and s[j] != quote:
                 j += 1
-            tokens.append(s[i+1:j])  # content without quotes
+            tokens.append(QuotedStr(s[i+1:j]))  # content without quotes, marked literal
             i = j + 1  # skip closing quote
         elif ch == '/':
             # Could be a /regex/ or a /path — scan for a closing /
-            # followed by a delimiter (or end of string)
+            # followed by a delimiter (or end of string). Stop at argument
+            # boundaries so we don't consume across commas/brackets.
             close = None
             j = i + 1
             while j < len(s):
-                if s[j] == '/':
+                ch_j = s[j]
+                if ch_j == '/':
                     # check if this / is followed by a delimiter or end
                     if j + 1 >= len(s) or s[j + 1] in DELIMS:
                         close = j
                         break
+                elif ch_j == ',':
+                    break
                 j += 1
             if close is not None and close > i + 1:
                 # /regex/ — include the delimiters
@@ -184,12 +196,15 @@ def _glob_to_regex(pattern):
 
 def _match_leaf(pattern, value):
     """Match a pattern string against a value string.
+    - QuotedStr ("..." / '...' in source) is always literal — no regex, no glob
     - "_" matches anything (as a whole argument)
     - "..." is handled by caller
     - "/X/" matches value against regex X
     - patterns containing * are globs (* = not /, ** = anything)
     - everything else is literal
     """
+    if isinstance(pattern, QuotedStr):
+        return pattern == value
     if pattern == '_':
         return True
     if len(pattern) >= 2 and pattern[0] == '/' and pattern[-1] == '/':

@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ptrace-approve"
-version = "3.0.0"
+version = "3.1.1"
 description = "Intercept and approve filesystem-modifying syscalls"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = [ "python-ptrace>=0.9.9", "pytest",]
+dependencies = [ "python-ptrace>=0.9.9", "pyperclip>=1.8.0", "pytest",]
 
 [project.license]
 text = "MIT"
@@ -16,6 +16,7 @@ text = "MIT"
 [project.scripts]
 ptrace-approve = "ptrace_approve.main:main"
 ptrace-pipx = "ptrace_approve.pipx:main"
+ptrace-clip = "ptrace_approve.clip:main"
 
 [tool.setuptools.packages.find]
 where = [ ".",]

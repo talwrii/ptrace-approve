@@ -1,6 +1,6 @@
 """Tests for ptrace_approve.match"""
 import pytest
-from ptrace_approve.match import parse, match, matches_any, _match_leaf, _tokenize
+from ptrace_approve.match import parse, match, matches_any, _match_leaf, _tokenize, QuotedStr
 
 # ---------------------------------------------------------------------------
 # Tokenizer
@@ -147,6 +147,49 @@ class TestMatchLeaf:
         # . in regex matches any char
         assert _match_leaf("/cd .+ && git rev-parse --abbrev-ref HEAD/",
                            "cd mine/kitty-claude && git rev-parse --abbrev-ref HEAD") is True
+
+    def test_quoted_is_always_literal(self):
+        # A QuotedStr pattern must match literally, even if it starts+ends with /
+        # (otherwise it would be misread as a regex).
+        assert _match_leaf(QuotedStr("/home/me/nutrition-pad/"),
+                           "/home/me/nutrition-pad/") is True
+        assert _match_leaf(QuotedStr("/home/me/nutrition-pad/"),
+                           "/home/me/other/") is False
+        # Quoting also disables * glob interpretation
+        assert _match_leaf(QuotedStr("/bin/*"), "/bin/*") is True
+        assert _match_leaf(QuotedStr("/bin/*"), "/bin/true") is False
+
+    def test_tokenizer_marks_quoted_strings(self):
+        tokens = _tokenize('exec(/bin/sh, ["/path/"])')
+        # the quoted "/path/" token must be a QuotedStr
+        quoted = [t for t in tokens if t == "/path/"]
+        assert quoted, "expected /path/ token"
+        assert isinstance(quoted[0], QuotedStr)
+
+    def test_match_quoted_path_literal(self):
+        # End-to-end: quoted path with leading+trailing slashes matches literally
+        assert match(
+            'exec(/bin/rsync, [rsync, "/home/me/data/"])',
+            "exec(/bin/rsync, [rsync, /home/me/data/])",
+        ) is True
+
+    def test_match_quoted_toplevel_arg(self):
+        # simplest case: one quoted path at top level
+        assert match('f("/a/")', "f(/a/)") is True
+
+    def test_match_quoted_in_list(self):
+        assert match('f([a, "/b/"])', "f([a, /b/])") is True
+
+    def test_match_two_args_quoted_second(self):
+        assert match('f(/x, "/a/")', "f(/x, /a/)") is True
+
+    def test_regex_with_brackets(self):
+        # regex containing [..] must not be broken by the regex scan
+        # (brackets are not argument boundaries, only commas are)
+        assert match(
+            r'f([a, /cd x && \[ -d y \] && .+/])',
+            "f([a, 'cd x && [ -d y ] && echo ok'])",
+        ) is True
 
 
 # ---------------------------------------------------------------------------

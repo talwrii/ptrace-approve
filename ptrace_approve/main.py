@@ -461,6 +461,33 @@ def _proc_chain(pid, stop_pid=None):
         current = _proc_ppid(current)
     return ' ← '.join(parts)
 
+def _unwrap_ptrace_shebang(cmd: list, explicit_profile: Optional[str]):
+    """If cmd[0] has a ptrace-approve shebang, strip it to avoid nested tracing.
+
+    Returns (new_cmd, profile_from_shebang_or_None).
+    """
+    import shutil
+    binary = shutil.which(cmd[0]) or cmd[0]
+    try:
+        with open(binary, "rb") as f:
+            first_line = f.readline(512)
+    except (OSError, IsADirectoryError):
+        return cmd, None
+    if not first_line.startswith(b"#!"):
+        return cmd, None
+    shebang = first_line.decode("utf-8", errors="replace").rstrip("\n")
+    m = re.match(
+        r'^#!/usr/bin/env -S ptrace-approve\s+(?:--profile\s+(\S+)\s+)?--\s+(.+)$',
+        shebang,
+    )
+    if not m:
+        return cmd, None
+    wrapped_profile = m.group(1)
+    interpreter_parts = m.group(2).strip().split()
+    new_cmd = interpreter_parts + [binary] + list(cmd[1:])
+    return new_cmd, (explicit_profile or wrapped_profile)
+
+
 def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_only: bool = False, strace_file=None, debug: bool = False, trace_children: bool = False, background_dir: str = None):
     from ptrace.debugger.child import createChild
     debugger = PtraceDebugger()
@@ -653,7 +680,7 @@ def run(cmd: list, app_key: str, profiles: dict, no_prompt: bool = False, log_on
             except NoBlockError as e:
                 # PTAPP_NO_BLOCK is set — kill the whole tree and exit 3
                 print(f"{RED}ERROR: ptrace-approve needs approval for: {e.description}{RESET}", file=sys.stderr)
-                print(f"  PTAPP_NO_BLOCK is set. Re-run with --background-dir DIR (see --help).", file=sys.stderr)
+                print(f"  PTAPP_NO_BLOCK is set. Re-run with --background-dir DIR (see `ptrace-approve --skill` for protocol).", file=sys.stderr)
                 try:
                     for p in list(debugger):
                         try: p.kill(9)
@@ -749,30 +776,53 @@ def list_profiles():
         for p in patterns:
             print(f"  {p}")
 
+SKILL_TEXT = """ptrace-approve background mode (for AI/non-interactive drivers)
+
+Setup:
+  export PTAPP_NO_BLOCK=1      # makes interactive prompts exit 3 instead of hanging
+
+Protocol:
+  ptrace-approve --background-dir DIR -- CMD &         # start subprocess
+  ptrace-approve --background-wait DIR                 # block for next event, prints JSON
+  ptrace-approve --background-respond DIR SEQ ACTION   # reply, then wait for next event
+
+Events (JSON on stdout):
+  {"seq": N, "description": "...", "app_key": "...", "pid": N, "status": "pending"}
+  {"status": "done", "exit_code": N}
+
+Actions for --background-respond:
+  approve                      # allow this call, ask again next time
+  deny                         # block this call, ask again next time
+  pattern --background-pattern P       # allow + save P to profile
+  deny_pattern --background-pattern P  # deny + save P to deny list
+  trust                        # allow + add exact match to profile
+  quit                         # kill the traced process
+
+Pattern syntax (for P):
+  exec(/path/to/bin, [argv0, arg1, ...])     exec call
+  open(/path, mode)                          open/openat
+  mkdir(/path)  unlink(/path)  rename(a -> b)   other syscalls
+  *            any single path segment (no /)
+  **           any path including /
+  _            any single argv arg
+  ...          all remaining argv args (trailing only)
+  "*"          literal asterisk
+  /regex/      regex (commas/slashes are separators)
+
+Exit codes:
+  --background-wait:      exits 0 after printing any event
+  --background-respond:   exits 0 during run, exits with subprocess's exit code when done
+  PTAPP_NO_BLOCK without --background-dir: exits 3
+"""
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Intercept and approve filesystem-modifying syscalls.",
-        epilog="""Background mode (for non-interactive callers, e.g. Claude Code):
-
-  Set PTAPP_NO_BLOCK=1 in the environment so interactive prompts exit 3 with an
-  error instead of hanging on stdin.
-
-  Three commands form the protocol:
-
-    1. Start in background:
-         ptrace-approve --background-dir DIR -- COMMAND &
-
-    2. Wait for next event:
-         ptrace-approve --background-wait DIR
-       prints JSON: {"status": "pending", "seq": N, "description": ...}
-                 or {"status": "done",    "exit_code": N}
-
-    3. Respond to a pending approval and wait for next event:
-         ptrace-approve --background-respond DIR SEQ ACTION
-       ACTION: approve | pattern | trust | deny | deny_pattern | quit
-       Add --background-pattern PATTERN for pattern/deny_pattern actions.
-
-  Loop step 3 until status is "done". Exits with the subprocess's exit code.
+        epilog="""Non-interactive / AI driver mode:
+  Run `ptrace-approve --skill` for full protocol, actions, and pattern syntax.
+  Short version: set PTAPP_NO_BLOCK=1, then drive with
+  --background-dir / --background-wait / --background-respond.
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -807,7 +857,13 @@ def main():
                         help="Respond to a pending approval: DIR SEQ ACTION (approve/pattern/trust/deny/deny_pattern/quit)")
     parser.add_argument("--background-pattern", metavar="PATTERN",
                         help="Pattern to use with --background-respond pattern/deny_pattern actions")
+    parser.add_argument("--skill", action="store_true",
+                        help="Print AI-driver skill doc (protocol, actions, pattern syntax) and exit")
     args = parser.parse_args()
+
+    if args.skill:
+        print(SKILL_TEXT, end="")
+        return
 
     if args.background_wait:
         background_wait(args.background_wait)
@@ -834,9 +890,10 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    args.cmd, shebang_profile = _unwrap_ptrace_shebang(args.cmd, args.profile)
     import shutil
     binary = shutil.which(args.cmd[0]) or args.cmd[0]
-    app_key = args.profile or binary
+    app_key = args.profile or shebang_profile or binary
     profiles = load_profiles()
 
     if args.clear_run:
